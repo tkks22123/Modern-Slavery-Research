@@ -1,0 +1,361 @@
+---
+title: "Bayesian Hierarchical Model for Modern Slavery Research"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+# Load required libraries
+library(readr)         # For reading CSV files
+library(VIM)           # For missing data visualization
+library(DMwR2)         # For KNN imputation
+library(ggplot2)       # For data visualization
+library(rstan)         # For Bayesian modeling with Stan
+library(stats)         # For statistical tests
+library(posterior)     # For posterior analysis
+library(bayesplot)     # For MCMC visualization
+library(dagitty)       # For DAG modeling
+library(ggdag)         # For DAG visualization
+library(corrplot)      # For correlation heatmap
+library(HDInterval)    # For HDI calculation
+
+# Set options for Stan
+rstan_options(auto_write = TRUE)  # Cache compiled models
+options(mc.cores = parallel::detectCores())  # Use multiple cores
+```
+
+```{r data-loading}
+# ====================== 1. Load and Impute Missing Data ======================
+train_raw <- read_csv("D:/Birmingham/birmingham/slavery.csv", show_col_types = FALSE)
+test_raw <- read_csv("D:/Birmingham/birmingham/test.csv", show_col_types = FALSE)
+
+# Perform KNN imputation with error handling
+combined_raw <- rbind(train_raw, test_raw)
+imputed_combined <- knnImputation(combined_raw, k = 5)
+train <- imputed_combined[1:nrow(train_raw), ]
+test <- imputed_combined[(nrow(train_raw)+1):nrow(imputed_combined), ]
+
+```
+
+```{r ks-test}
+# ====================== 2. KS Tests and Density Plots ======================
+# Function to perform KS test and plot density
+ks_test_and_plot <- function(orig, imp, col_name) {
+  if (is.numeric(orig) && any(is.na(orig))) {
+      ks <- ks.test(orig[!is.na(orig)], imp, exact = FALSE)
+      cat(sprintf("KS test for %s: p-value = %.4f\n", col_name, ks$p.value))
+      
+      df_plot <- data.frame(
+        value = c(orig[!is.na(orig)], imp),
+        group = rep(c("original", "imputed"), c(sum(!is.na(orig)), length(imp)))
+      )
+      p <- ggplot(df_plot, aes(x = value, fill = group)) +
+        geom_density(alpha = 0.4) + 
+        ggtitle(paste("Density of", col_name)) +
+        theme_minimal()
+      print(p)
+  }
+}
+
+# Apply function to each column
+for (col in names(train)[-1]) {
+  orig <- train_raw[[col]]
+  imp <- train[[col]]
+  ks_test_and_plot(orig, imp, col)
+}
+```
+
+```{r correlation}
+# ====================== 3. Data Visualision ======================
+# Select only numeric variables
+numeric_vars <- c("V_Issues", "V_Needs", "V_Inequality", "V_Disenfranchised", "V_Conflict",
+                  "G_Survivorsy", "G_Justice", "G_Coordination", "G_Risk", "G_Stop")
+
+# Compute correlation matrix
+cor_matrix <- cor(train[, numeric_vars], use = "pairwise.complete.obs")
+
+# Plot correlation heatmap
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", number.cex = 0.7,
+         col = colorRampPalette(c("blue", "white", "red"))(200),
+         title = "Correlation Matrix of Numeric Covariates", mar = c(0,0,2,0))
+```
+
+```{r stan-prep}
+# ====================== 4. Prepare Data for Stan ======================
+train_mean <- colMeans(train[, numeric_vars])
+train_sd <- apply(train[, numeric_vars], 2, sd)
+
+for (var in numeric_vars) {
+  train[[var]] <- (train[[var]] - train_mean[var]) / train_sd[var]
+  test[[var]] <- (test[[var]] - train_mean[var]) / train_sd[var]
+}
+
+# Prepare Stan data with explicit variable list
+stan_data <- list(
+  N = nrow(train),
+  y = train$prevalence,
+  x1 = as.integer(train$Africa),
+  x2 = as.integer(train$Americas),
+  x3 = as.integer(train$ArabStates),
+  x4 = as.integer(train$AsiaandthePacific),
+  x5 = train$V_Issues,
+  x6 = train$V_Needs,
+  x7 = train$V_Inequality,
+  x8 = train$V_Disenfranchised,
+  x9 = train$V_Conflict,
+  x10 = train$G_Survivorsy,
+  x11 = train$G_Justice,
+  x12 = train$G_Coordination,
+  x13 = train$G_Risk,
+  x14 = train$G_Stop
+)
+```
+
+```{r stan-model, results='hide'}
+# ====================== 5. Define Stan Model ======================
+# Stan model with explicit parameter count matching
+stan_model_code <- "
+data {
+  int<lower=0> N;                // Number of observations
+  real y[N];                     // Response variable
+  int<lower=0, upper=1> x1[N];   // Categorical predictor 1
+  int<lower=0, upper=1> x2[N];   // Categorical predictor 2
+  int<lower=0, upper=1> x3[N];   // Categorical predictor 3
+  int<lower=0, upper=1> x4[N];   // Categorical predictor 4
+  real x5[N];                    // Numeric predictor 1
+  real x6[N];                    // Numeric predictor 2
+  real x7[N];                    // Numeric predictor 3
+  real x8[N];                    // Numeric predictor 4
+  real x9[N];                    // Numeric predictor 5
+  real x10[N];                   // Numeric predictor 6
+  real x11[N];                   // Numeric predictor 7
+  real x12[N];                   // Numeric predictor 8
+  real x13[N];                   // Numeric predictor 9
+  real x14[N];                   // Numeric predictor 10
+}
+parameters {
+  real gamma;                   // Global intercept
+  real alpha[3];                 // Group means for betas
+  real<lower=0> delta[3];        // Group standard deviations for betas
+  real beta[14];                 // Regression coefficients
+  real lambda[N];                // Individual random effects
+  real<lower=0> tau;             // SD of random effects
+}
+transformed parameters {
+  real theta[N];                 // Linear predictor
+  for (i in 1:N) {
+    theta[i] = gamma +
+               beta[1] * x1[i] + beta[2] * x2[i] + beta[3] * x3[i] + beta[4] * x4[i] +
+               beta[5] * x5[i] + beta[6] * x6[i] + beta[7] * x7[i] + beta[8] * x8[i] + beta[9] * x9[i] +
+               beta[10] * x10[i] + beta[11] * x11[i] + beta[12] * x12[i] + beta[13] * x13[i] + beta[14] * x14[i]
+               + lambda[i];
+  }
+}
+model {
+  // Tighter priors for better numerical stability
+  gamma ~ normal(0, 1000);
+  alpha ~ normal(0, 1000);
+  delta ~ cauchy(0, 100);
+  tau ~ cauchy(0, 100);
+
+  // Hierarchical structure for betas
+  for (k in 1:4) beta[k] ~ normal(alpha[1], delta[1]);
+  for (k in 5:9) beta[k] ~ normal(alpha[2], delta[2]);
+  for (k in 10:14) beta[k] ~ normal(alpha[3], delta[3]);
+
+  // Random effects
+  lambda ~ normal(0, tau);
+
+  // Likelihood
+  y ~ exponential(exp(-theta));
+}
+generated quantities {
+  real y_pred[N];                // Posterior predictive samples
+  for (i in 1:N) {
+    y_pred[i] = exponential_rng(exp(-theta[i]));
+  }
+}
+"
+```
+
+```{r stan-fit}
+# ====================== 6. Fit the Model ======================
+# Compile model with explicit parameter checking
+cat("\nCompiling Stan model...\n")
+compiled_model <- stan_model(model_code = stan_model_code)
+
+# Fit model with optimized parameters
+cat("\nFitting model...\n")
+fit <- try(sampling(
+  object = compiled_model,
+  data = stan_data,
+  iter = 2000,
+  warmup = 300,
+  chains = 4,
+  thin = 1,
+  seed = 123,
+  control = list(
+    adapt_delta = 0.99,        # Higher adapt_delta for better convergence
+    max_treedepth = 15,        # Increase tree depth
+    stepsize = 0.01            # Smaller stepsize for stability
+  )
+), silent = TRUE)
+posterior_samples <- rstan::extract(fit)
+
+gamma_samples <- posterior_samples$gamma
+tau_samples <- posterior_samples$tau
+alpha_samples <- posterior_samples$alpha
+delta_samples <- posterior_samples$delta
+beta_samples <- posterior_samples$beta
+
+# Trace plot
+mcmc_trace(as.array(fit), pars = c("gamma", "tau", "beta[1]", "beta[14]", "alpha[1]", "delta[1]"))
+```
+
+```{r posterior}
+# ====================== 7. Posterior Distribution ======================
+cat("\n95% HDI (DEI) for Model Parameters:\n")
+cat(sprintf("gamma: %.3f to %.3f\n", hdi(gamma_samples)[1], hdi(gamma_samples)[2]))
+cat(sprintf("tau: %.3f to %.3f\n", hdi(tau_samples)[1], hdi(tau_samples)[2]))
+
+for (i in 1:3) {
+  cat(sprintf("alpha[%d]: %.3f to %.3f\n", i, hdi(alpha_samples[, i])[1], hdi(alpha_samples[, i])[2]))
+}
+for (i in 1:3) {
+  cat(sprintf("delta[%d]: %.3f to %.3f\n", i, hdi(delta_samples[, i])[1], hdi(delta_samples[, i])[2]))
+}
+for (i in 1:14) {
+  hdi_i <- hdi(beta_samples[, i])
+  cat(sprintf("beta[%d]: %.3f to %.3f\n", i, hdi_i[1], hdi_i[2]))
+}
+
+# Plot posterior distributions
+par(mfrow = c(3, 2))  # 3 rows, 2 columns
+
+plot(density(gamma_samples), main = paste("Posterior of",expression(gamma)), xlab = expression(gamma[0]))
+abline(v = hdi(gamma_samples), col = "red", lty = 2)
+
+plot(density(tau_samples), main = paste("Posterior of",expression(tau)), xlab = expression(tau))
+abline(v = hdi(tau_samples), col = "red", lty = 2)
+
+plot(density(beta_samples[,1]), main = paste("Posterior of",expression(beta[1])), xlab = expression(beta[1]))
+abline(v = hdi(beta_samples[,1]), col = "red", lty = 2)
+
+plot(density(beta_samples[,14]), main = paste("Posterior of",expression(beta[14])), xlab =expression(beta[14]))
+abline(v = hdi(beta_samples[,14]), col = "red", lty = 2)
+
+plot(density(alpha_samples[,1]), main = paste("Posterior of",expression(alpha[1])), xlab = expression(alpha[1]))
+abline(v = hdi(alpha_samples[,1]), col = "red", lty = 2)
+
+plot(density(delta_samples[,1]), main = paste("Posterior of",expression(delta[1])), xlab = expression(delta[1]))
+abline(v = hdi(delta_samples[,1]), col = "red", lty = 2)
+```
+
+```{r training-prediction}
+# ====================== 8. Training Set Predictions ======================
+y_pred_train <- posterior_samples$y_pred
+
+# Calculate training predictions
+pred_train_mean <- colMeans(y_pred_train)
+pred_train_lower <- apply(y_pred_train, 2, quantile, 0.025)
+pred_train_upper <- apply(y_pred_train, 2, quantile, 0.975)
+
+# Plot training predictions
+df_train_plot <- data.frame(
+  True = train$prevalence,
+  Predicted = pred_train_mean,
+  Lower = pred_train_lower,
+  Upper = pred_train_upper
+)
+
+p_train <- ggplot(df_train_plot, aes(x = True, y = Predicted)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.1, alpha = 0.3) +
+  ggtitle("Training Set: True vs Predicted Values") + 
+  xlab("True Values") + ylab("Predicted Values (with 95% CI)") +
+  theme_minimal()
+print(p_train)
+
+# Training set evaluation
+train_rmse <- sqrt(mean((pred_train_mean - train$prevalence)^2))
+train_mae <- mean(abs(pred_train_mean - train$prevalence))
+train_mape <- mean(abs((pred_train_mean - train$prevalence) / train$prevalence)) * 100
+
+cat(sprintf("\nTraining Set Evaluation:\nRMSE: %.3f\nMAE: %.3f\nMAPE: %.3f%%\n", 
+            train_rmse, train_mae, train_mape))
+```
+
+```{r test-prediction}
+# ====================== 9. Test Set Predictions ======================
+# Prepare test data
+test_data_stan <- list(
+  x1 = as.integer(test$Africa),
+  x2 = as.integer(test$Americas),
+  x3 = as.integer(test$ArabStates),
+  x4 = as.integer(test$AsiaandthePacific),
+  x5 = test$V_Issues,
+  x6 = test$V_Needs,
+  x7 = test$V_Inequality,
+  x8 = test$V_Disenfranchised,
+  x9 = test$V_Conflict,
+  x10 = test$G_Survivorsy,
+  x11 = test$G_Justice,
+  x12 = test$G_Coordination,
+  x13 = test$G_Risk,
+  x14 = test$G_Stop,
+  N = nrow(test)
+)
+
+# Predict on test set
+theta_test <- array(0, dim = c(nrow(beta_samples), nrow(test)))
+
+for (i in 1:nrow(beta_samples)) {
+  theta_test[i, ] <- posterior_samples$gamma[i] + 
+    test_data_stan$x1 * posterior_samples$beta[i, 1] +
+    test_data_stan$x2 * posterior_samples$beta[i, 2] +
+    test_data_stan$x3 * posterior_samples$beta[i, 3] +
+    test_data_stan$x4 * posterior_samples$beta[i, 4] +
+    test_data_stan$x5 * posterior_samples$beta[i, 5] +
+    test_data_stan$x6 * posterior_samples$beta[i, 6] +
+    test_data_stan$x7 * posterior_samples$beta[i, 7] +
+    test_data_stan$x8 * posterior_samples$beta[i, 8] +
+    test_data_stan$x9 * posterior_samples$beta[i, 9] +
+    test_data_stan$x10 * posterior_samples$beta[i, 10] +
+    test_data_stan$x11 * posterior_samples$beta[i, 11] +
+    test_data_stan$x12 * posterior_samples$beta[i, 12] +
+    test_data_stan$x13 * posterior_samples$beta[i, 13] +
+    test_data_stan$x14 * posterior_samples$beta[i, 14]
+}
+
+# Generate test predictions
+pred_test <- apply(theta_test, c(1, 2), function(t) rexp(1, rate = exp(-t)))
+pred_test_mean <- colMeans(pred_test)
+pred_test_lower <- apply(pred_test, 2, quantile, 0.025)
+pred_test_upper <- apply(pred_test, 2, quantile, 0.975)
+
+# Plot test predictions
+df_test_plot <- data.frame(
+  True = test$prevalence,
+  Predicted = pred_test_mean,
+  Lower = pred_test_lower,
+  Upper = pred_test_upper
+)
+
+p_test <- ggplot(df_test_plot, aes(x = True, y = Predicted)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.1, alpha = 0.3) +
+  ggtitle("Test Set: True vs Predicted Values") + 
+  xlab("True Values") + ylab("Predicted Values (with 95% CI)") +
+  theme_minimal()
+print(p_test)
+
+# Test set evaluation
+test_rmse <- sqrt(mean((pred_test_mean - test$prevalence)^2))
+test_mae <- mean(abs(pred_test_mean - test$prevalence))
+test_mape <- mean(abs((pred_test_mean - test$prevalence) / test$prevalence)) * 100
+
+cat(sprintf("\nTest Set Evaluation:\nRMSE: %.3f\nMAE: %.3f\nMAPE: %.3f%%\n", 
+            test_rmse, test_mae, test_mape))
