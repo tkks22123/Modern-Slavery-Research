@@ -26,8 +26,8 @@ options(mc.cores = parallel::detectCores())  # Use multiple cores
 
 ```{r data-loading}
 # ====================== 1. Load and Impute Missing Data ======================
-train_raw <- read_csv("D:/Birmingham/birmingham/slavery.csv", show_col_types = FALSE)
-test_raw <- read_csv("D:/Birmingham/birmingham/test.csv", show_col_types = FALSE)
+train_raw <- read_csv("slavery.csv", show_col_types = FALSE)
+test_raw <- read_csv("test.csv", show_col_types = FALSE)
 
 # Perform KNN imputation with error handling
 combined_raw <- rbind(train_raw, test_raw)
