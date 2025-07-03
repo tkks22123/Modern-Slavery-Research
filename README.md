@@ -4,3 +4,5 @@ Hierarchy model between the prevalence of modern slavery and the risk factors
 The model structure is illustrated in the attached pdf file.
 
 Data set can be downloaded at https://www.walkfree.org/global-slavery-index/downloads/.
+
+This model is to be adjusted to fix the issues in MCMC.
